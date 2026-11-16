@@ -1,0 +1,97 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example 1.1.0)
+        required: true
+        default: '1.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_HUB_DISABLE_SYMLINKS_WARNING: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Validate version
+        run: python -c "import os,re; assert re.fullmatch(r'\d+\.\d+\.\d+', os.environ['RELEASE_VERSION'])"
+      - name: Install dependencies and test
+        run: |
+          & .\setup.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.venv\Scripts\python.exe -m pytest -q
+          exit $LASTEXITCODE
+      - name: Download small models
+        run: |
+          @'
+          from faster_whisper.utils import download_model
+          from huggingface_hub import hf_hub_download
+          download_model('small', cache_dir='data/models')
+          hf_hub_download('ggerganov/whisper.cpp', 'ggml-small.bin', cache_dir='data/models-vulkan')
+          '@ | .\.venv\Scripts\python.exe -
+          exit $LASTEXITCODE
+      - name: Build portable application
+        run: |
+          & .\build.ps1 -IncludeCachedModels
+          exit $LASTEXITCODE
+      - name: Smoke test packaged CPU engine offline
+        run: |
+          @'
+          import os, subprocess, wave
+          from pathlib import Path
+          from docx import Document
+          sample = Path('build/release-silence.wav').resolve()
+          with wave.open(str(sample), 'wb') as wav:
+              wav.setnchannels(1)
+              wav.setsampwidth(2)
+              wav.setframerate(16000)
+              wav.writeframes(bytes(32000))
+          output = Path('build/smoke-output').resolve()
+          result = subprocess.run([str(Path('dist/Transcriber/Transcriber.exe').resolve()), '--cli', '--device', 'cpu', '--output', str(output), str(sample)], env={**os.environ, 'HF_HUB_OFFLINE':'1'}, timeout=180)
+          assert result.returncode == 0, result.returncode
+          document = Document(next(output.glob('*.docx')))
+          assert any('Речь не обнаружена' in paragraph.text for paragraph in document.paragraphs)
+          '@ | .\.venv\Scripts\python.exe -
+          exit $LASTEXITCODE
+      - name: Package and check archive
+        run: |
+          & .\.venv\Scripts\python.exe tools\package_release.py --include-models --version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.venv\Scripts\python.exe -c "import os,zipfile; z=zipfile.ZipFile('releases/Transcriber-'+os.environ['RELEASE_VERSION']+'-Windows-x64.zip'); assert z.testzip() is None"
+          exit $LASTEXITCODE
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            & gh release create $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Транскрибер $env:RELEASE_VERSION — Windows x64" --notes 'Готовая переносимая сборка с моделями small для CPU/NVIDIA и Vulkan. Распакуйте всю папку и запустите Transcriber.exe. Инструкция находится в README.' --draft
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          & gh release upload $tag "releases/Transcriber-$env:RELEASE_VERSION-Windows-x64.zip" releases/SHA256SUMS.txt --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & gh release edit $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --draft=false --latest
+          exit $LASTEXITCODE
